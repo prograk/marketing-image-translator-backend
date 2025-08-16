@@ -1,12 +1,10 @@
 from fastapi import FastAPI, File, UploadFile, HTTPException, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, FileResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
-from typing import List, Dict, Optional
+from typing import List, Dict
 import uvicorn
 import os
-import shutil
 import json
 import uuid
 from datetime import datetime
@@ -363,67 +361,6 @@ async def clear_session(session_id: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/health")
-async def health_check():
-    """Health check endpoint"""
-    return {
-        "status": "healthy",
-        "ocr_ready": ocr_handler is not None,
-        "active_sessions": len(sessions),
-        "temp_files": len(os.listdir("temp")) if os.path.exists("temp") else 0
-    }
-    """Translate selected text regions"""
-    
-    if session_id not in sessions:
-        raise HTTPException(status_code=404, detail="Session not found")
-    
-    # Use mock handler if no API key
-    if api_key:
-        translator = TranslationHandler(api_key)
-    else:
-        translator = MockTranslationHandler()
-    
-    # Get selected regions
-    session_data = sessions[session_id]
-    texts_to_translate = []
-    
-    for region in session_data['text_regions']:
-        if region.get('selected_for_translation', False):
-            texts_to_translate.append({
-                'id': region['id'],
-                'text': region['text']
-            })
-    
-    # Translate texts
-    translations = {}
-    for text_item in texts_to_translate:
-        result = translator.translate_sync(
-            text_item['text'], 
-            target_language, 
-            model
-            # Remove the context parameter since it's not supported
-        )
-        if result['success']:
-            translations[text_item['id']] = result['translated']
-    
-    # Process image
-    processor = ImageProcessor()
-    output_path = f"output/{session_id}_{target_language}.png"
-    
-    success = processor.process_image(
-        session_data['original_image_path'],
-        translations,
-        target_language,
-        session_data['text_regions'],
-        output_path
-    )
-    
-    return {
-        "success": success,
-        "translations": translations,
-        "output_path": output_path
-    }
-
 @app.post("/translate")
 async def translate_regions(
     session_id: str = Form(...),
@@ -609,25 +546,6 @@ async def translate_regions(
             status_code=500, 
             detail=f"Translation failed: {str(e)}"
         )
-
-@app.get("/test-fonts/{language}")
-async def test_fonts(language: str = "hindi"):
-    """Test font rendering for a language"""
-    try:
-        from image_processor import ImageProcessor
-        processor = ImageProcessor()
-        processor.test_rendering(language)
-        
-        return {
-            "success": True,
-            "message": f"Font test completed for {language}",
-            "test_image": f"fonts/test_{language}.png"
-        }
-    except Exception as e:
-        return {
-            "success": False,
-            "error": str(e)
-        }
 
 @app.post("/save-selections")
 async def save_text_selections(request: dict):

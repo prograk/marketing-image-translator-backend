@@ -1,9 +1,6 @@
 import easyocr
 import numpy as np
-from PIL import Image
-import io
-import base64
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict
 import cv2
 
 class OCRHandler:

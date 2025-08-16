@@ -3,10 +3,11 @@ import platform
 import requests
 import zipfile
 from fontTools.ttLib import TTFont
-from PIL import ImageFont
+from PIL import ImageFont, Image, ImageDraw
 from pathlib import Path
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Union
 import numpy as np
+import cv2
 
 class FontManager:
     def __init__(self, cache_dir: str = "fonts"):
@@ -329,7 +330,7 @@ class FontManager:
         except:
             # Fallback method
             return font.getsize(text)
-    
+
     def wrap_text(self, text: str, font: ImageFont.FreeTypeFont, max_width: int) -> List[str]:
         """Wrap text to fit within max_width"""
         words = text.split(' ')
@@ -356,29 +357,73 @@ class FontManager:
         return lines
     
     def analyze_original_font(self, image_path: str, x: int, y: int, w: int, h: int, text: str) -> Dict:
-        """Analyze original font properties from image region"""
+        """Enhanced analysis of original font properties from image region"""
         try:
             from PIL import Image
             
             image = Image.open(image_path).convert('RGB')
             img_array = np.array(image)
             
-            # Extract region
-            region = img_array[y:y+h, x:x+w] if h > 0 and w > 0 else np.array([[[255,255,255]]])
+            print(f"\n=== DEBUGGING COLOR DETECTION FOR: '{text}' ===")
+            print(f"Text region coordinates: x={x}, y={y}, w={w}, h={h}")
+            
+            # Extract CORE text region (center 60% to avoid edges and background)
+            margin_x = max(1, w // 5)  # 20% margin on each side
+            margin_y = max(1, h // 5)  # 20% margin on top/bottom
+            
+            core_x_start = max(0, x + margin_x)
+            core_y_start = max(0, y + margin_y)
+            core_x_end = min(img_array.shape[1], x + w - margin_x)
+            core_y_end = min(img_array.shape[0], y + h - margin_y)
+            
+            # Extract regions
+            text_region = img_array[core_y_start:core_y_end, core_x_start:core_x_end]
+            
+            # Context region (larger area around text)
+            padding = max(5, min(w, h) // 8)
+            context_x_start = max(0, x - padding)
+            context_y_start = max(0, y - padding)
+            context_x_end = min(img_array.shape[1], x + w + padding)
+            context_y_end = min(img_array.shape[0], y + h + padding)
+            context_region = img_array[context_y_start:context_y_end, context_x_start:context_x_end]
+            
+            print(f"Core text region shape: {text_region.shape}")
+            print(f"Using core region: x={core_x_start}-{core_x_end}, y={core_y_start}-{core_y_end}")
+            
+            if text_region.size == 0:
+                print("WARNING: Core text region is empty, using full region")
+                text_region = img_array[y:y+h, x:x+w] if h > 0 and w > 0 else np.array([[[255,255,255]]])
+            
+            # Enhanced font size calculation
+            estimated_size = self._calculate_optimal_font_size(text, w, h, text_region)
+            
+            # Enhanced weight detection
+            weight = self._detect_font_weight_advanced(text_region, estimated_size)
+            
+            # Enhanced color extraction WITH DEBUG
+            text_color = self._extract_text_color_advanced(text_region, context_region, text)
+            
+            # Background color analysis
+            background_color = self._extract_background_color_advanced(img_array, x, y, w, h)
             
             font_props = {
-                'estimated_size': max(12, int(h * 0.75)),
-                'weight': 'normal',
-                'style': 'normal',  # Add missing style key
-                'color': self._extract_text_color(region),
-                'background': self._extract_background_color(img_array, x, y, w, h)
+                'estimated_size': estimated_size,
+                'weight': weight,
+                'style': 'normal',  # Can be enhanced later for italic detection
+                'color': text_color,
+                'background': background_color,
+                'contrast_ratio': self._calculate_contrast_ratio(text_color, background_color),
+                'text_density': self._calculate_text_density(text_region)
             }
             
-            # Detect bold text (thicker strokes)
-            if self._appears_bold(region):
-                font_props['weight'] = 'bold'
+            print(f"=== FINAL ANALYSIS FOR '{text}' ===")
+            print(f"  Size: {font_props['estimated_size']}")
+            print(f"  Weight: {font_props['weight']}")
+            print(f"  Color: RGB{font_props['color']}")
+            print(f"  Background: RGB{font_props['background']}")
+            print(f"  Contrast: {font_props['contrast_ratio']:.2f}")
+            print(f"=======================================\n")
             
-            print(f"Analyzed: size={font_props['estimated_size']}, weight={font_props['weight']}, color={font_props['color']}")
             return font_props
             
         except Exception as e:
@@ -386,58 +431,428 @@ class FontManager:
             return {
                 'estimated_size': 20,
                 'weight': 'normal',
-                'style': 'normal',  # Add missing style key in fallback too
+                'style': 'normal',
                 'color': (255, 255, 255),
-                'background': (41, 128, 185)
+                'background': (41, 128, 185),
+                'contrast_ratio': 4.5,
+                'text_density': 0.3
             }
     
-    def _extract_text_color(self, region) -> tuple:
-        """Extract text color from region"""
+    def _calculate_optimal_font_size(self, text: str, width: int, height: int, region: np.ndarray) -> int:
+        """Simplified but robust font size calculation"""
         try:
-            pixels = region.reshape(-1, 3)
+            # Primary calculation based on height (most reliable)
+            height_based_size = max(8, int(height * 0.75))
+            
+            # Secondary validation using stroke thickness
+            stroke_thickness = self._analyze_stroke_thickness(region)
+            if stroke_thickness > 2:  # Only use if we have clear stroke data
+                stroke_based_size = max(8, int(stroke_thickness * 6))
+                # Use stroke size only if it's reasonable (within 50% of height-based)
+                if 0.5 * height_based_size <= stroke_based_size <= 1.5 * height_based_size:
+                    height_based_size = int(0.8 * height_based_size + 0.2 * stroke_based_size)
+            
+            # Simple character density check (prevent extreme cases)
+            text_length = len(text.strip())
+            if text_length > 0:
+                char_width = width / text_length
+                if char_width < 6:  # Very cramped text
+                    height_based_size = max(8, int(height_based_size * 0.9))
+                elif char_width > 30:  # Very sparse text  
+                    height_based_size = min(48, int(height_based_size * 1.1))
+            
+            # Ensure reasonable bounds
+            final_size = max(8, min(48, height_based_size))
+            
+            print(f"Size calc: height={height} → base={int(height * 0.75)} → final={final_size}")
+            return final_size
+            
+        except Exception as e:
+            print(f"Error calculating font size: {e}")
+            return max(12, int(height * 0.75))
+    
+    def _detect_font_weight_advanced(self, text_region: np.ndarray, font_size: int) -> str:
+        """Advanced font weight detection using multiple techniques"""
+        try:
+            if text_region.size == 0:
+                return 'normal'
+            
+            # Convert to grayscale
+            gray = cv2.cvtColor(text_region, cv2.COLOR_RGB2GRAY)
+            
+            # Method 1: Stroke width analysis
+            stroke_width = self._analyze_stroke_thickness(text_region)
+            
+            # Method 2: Edge density analysis
+            edges = cv2.Canny(gray, 50, 150)
+            edge_density = np.sum(edges > 0) / edges.size
+            
+            # Method 3: Intensity gradient analysis
+            grad_x = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+            grad_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+            gradient_magnitude = np.sqrt(grad_x**2 + grad_y**2)
+            avg_gradient = np.mean(gradient_magnitude)
+            
+            # Method 4: Text pixel density
+            _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            text_pixel_ratio = np.sum(binary < 128) / binary.size
+            
+            # Combine metrics for decision
+            bold_score = 0
+            
+            # Stroke width scoring (normalized by font size)
+            if stroke_width > 0:
+                normalized_stroke = stroke_width / (font_size / 16)  # Normalize to 16px baseline
+                if normalized_stroke > 1.5:
+                    bold_score += 2
+                elif normalized_stroke > 1.2:
+                    bold_score += 1
+            
+            # Edge density scoring
+            if edge_density > 0.15:
+                bold_score += 1
+            
+            # Gradient scoring
+            if avg_gradient > 30:
+                bold_score += 1
+            
+            # Text density scoring
+            if text_pixel_ratio > 0.35:
+                bold_score += 1
+            
+            # Decision threshold
+            weight = 'bold' if bold_score >= 3 else 'normal'
+            
+            print(f"Weight analysis: stroke={stroke_width:.2f}, edge_density={edge_density:.3f}, "
+                  f"gradient={avg_gradient:.1f}, density={text_pixel_ratio:.3f}, score={bold_score} → {weight}")
+            
+            return weight
+            
+        except Exception as e:
+            print(f"Error detecting font weight: {e}")
+            return 'normal'
+    
+    def _analyze_stroke_thickness(self, region: np.ndarray) -> float:
+        """Analyze average stroke thickness of text"""
+        try:
+            if region.size == 0:
+                return 0
+            
+            # Convert to grayscale
+            gray = cv2.cvtColor(region, cv2.COLOR_RGB2GRAY)
+            
+            # Apply threshold to get binary image
+            _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            
+            # Invert so text is white
+            binary = cv2.bitwise_not(binary)
+            
+            # Calculate distance transform
+            dist_transform = cv2.distanceTransform(binary, cv2.DIST_L2, 5)
+            
+            # Find skeleton and calculate average thickness
+            non_zero_distances = dist_transform[dist_transform > 0]
+            if len(non_zero_distances) > 0:
+                # Average thickness is 2 * average distance
+                avg_thickness = 2 * np.mean(non_zero_distances.astype(float))
+                return float(avg_thickness)
+            
+            return 0
+            
+        except Exception as e:
+            return 0
+    
+    def _extract_text_color_advanced(self, text_region: np.ndarray, context_region: np.ndarray, text: str = "") -> tuple:
+        """Advanced text color extraction using context WITH DEBUG"""
+        try:
+            if text_region.size == 0:
+                print(f"  DEBUG: Empty text region for '{text}', returning white")
+                return (255, 255, 255)
+            
+            print(f"  DEBUG: Analyzing color for '{text}'")
+            print(f"  Text region shape: {text_region.shape}")
+            
+            # Convert to different color spaces for analysis
+            text_rgb = text_region
+            
+            # Method 1: Simple dominant color approach (PRIORITIZED FOR BRIGHT TEXT)
+            pixels = text_rgb.reshape(-1, 3)
             unique_colors, counts = np.unique(pixels, axis=0, return_counts=True)
             
-            # Find most contrasting color against blue background
-            bg_color = np.array([41, 128, 185])
+            print(f"  DEBUG: Found {len(unique_colors)} unique colors")
+            print(f"  DEBUG: Top 5 colors by frequency:")
+            
+            # Sort by frequency
+            sorted_indices = np.argsort(counts)[::-1]
+            for i in range(min(5, len(unique_colors))):
+                idx = sorted_indices[i]
+                color = unique_colors[idx]
+                count = counts[idx]
+                percentage = (count / len(pixels)) * 100
+                brightness = np.mean(color)
+                print(f"    Color RGB{tuple(color)}: {count} pixels ({percentage:.1f}%) brightness={brightness:.1f}")
+            
+            # PRIORITY 1: Check for bright colors first (WHITE TEXT DETECTION)
+            print(f"  DEBUG: Checking for bright colors (brightness > 200)...")
+            for i, idx in enumerate(sorted_indices):
+                color = unique_colors[idx]
+                count = counts[idx]
+                percentage = (count / len(pixels)) * 100
+                brightness = np.mean(color)
+                
+                # Lower threshold for small text regions (adjust dynamically)
+                total_pixels = len(pixels)
+                min_threshold = max(1.0, min(5.0, 1000.0 / total_pixels))  # Adaptive threshold
+                
+                # Look for bright colors that represent significant portion of text
+                if brightness > 200 and percentage > min_threshold:
+                    print(f"  DEBUG: Found bright text color! RGB{tuple(color)} (brightness={brightness:.1f}, {percentage:.1f}%)")
+                    final_color = tuple(map(int, color))
+                    print(f"  DEBUG: USING BRIGHT COLOR: RGB{final_color}")
+                    return final_color
+            
+            # PRIORITY 2: Check for white-ish colors even if not most frequent (LOWER THRESHOLD)
+            print(f"  DEBUG: No dominant bright color found, checking for any white-ish colors...")
+            for i, idx in enumerate(sorted_indices[:15]):  # Check top 15 colors
+                color = unique_colors[idx]
+                count = counts[idx]
+                percentage = (count / len(pixels)) * 100
+                
+                # Even lower threshold for white-ish colors
+                min_white_threshold = max(0.5, min(2.0, 500.0 / len(pixels)))
+                
+                # Check if color is white-ish (all RGB values > 200)
+                if np.all(color > 200) and percentage > min_white_threshold:
+                    print(f"  DEBUG: Found white-ish color! RGB{tuple(color)} ({percentage:.1f}%) - using adaptive threshold {min_white_threshold:.1f}%")
+                    final_color = tuple(map(int, color))
+                    print(f"  DEBUG: USING WHITE-ISH COLOR: RGB{final_color}")
+                    return final_color
+            
+            # PRIORITY 2.5: Check for very bright colors (brightness > 180) with even lower threshold
+            print(f"  DEBUG: Checking for any bright-ish colors (brightness > 180)...")
+            for i, idx in enumerate(sorted_indices[:20]):
+                color = unique_colors[idx]
+                count = counts[idx]
+                percentage = (count / len(pixels)) * 100
+                brightness = np.mean(color)
+                
+                if brightness > 180 and percentage > 0.1:  # Very low threshold for any bright color
+                    print(f"  DEBUG: Found bright-ish color! RGB{tuple(color)} (brightness={brightness:.1f}, {percentage:.1f}%)")
+                    final_color = tuple(map(int, color))
+                    print(f"  DEBUG: USING BRIGHT-ISH COLOR: RGB{final_color}")
+                    return final_color
+            
+            # Determine if we likely have dark background (for edge detection decision)
+            bg_color = np.median(context_region.reshape(-1, 3), axis=0) if context_region.size > 0 else np.array([128, 128, 128])
+            bg_brightness = np.mean(bg_color)
+            print(f"  DEBUG: Background brightness: {bg_brightness:.1f}")
+            
+            # PRIORITY 3: Only use edge detection for dark text on light backgrounds
+            if bg_brightness > 150:  # Light background - likely dark text
+                print(f"  DEBUG: Light background detected, using edge-based detection for dark text...")
+                
+                gray = cv2.cvtColor(text_rgb, cv2.COLOR_RGB2GRAY)
+                edges = cv2.Canny(gray, 50, 150)
+                
+                # Dilate edges to capture text strokes
+                kernel = np.ones((3,3), np.uint8)
+                dilated_edges = cv2.dilate(edges, kernel, iterations=1)
+                
+                # Extract colors from edge regions
+                edge_pixels = text_rgb[dilated_edges > 0]
+                
+                print(f"  DEBUG: Edge detection found {len(edge_pixels)} edge pixels")
+                
+                if len(edge_pixels) > 0:
+                    edge_color = np.median(edge_pixels, axis=0)
+                    contrast_score = np.linalg.norm(edge_color - bg_color)
+                    print(f"  DEBUG: Edge-based color: RGB{tuple(map(int, edge_color))}")
+                    print(f"  DEBUG: Contrast score: {contrast_score:.2f}")
+                    
+                    if contrast_score > 50:  # Good contrast
+                        print(f"  DEBUG: Using edge-based color for dark text")
+                        final_color = tuple(map(int, edge_color))
+                        print(f"  DEBUG: FINAL COLOR: RGB{final_color}")
+                        return final_color
+            
+            # PRIORITY 4: For dark backgrounds, look for the most contrasting color
+            print(f"  DEBUG: Dark background detected, looking for most contrasting color...")
+            
             max_contrast = 0
-            text_color = (255, 255, 255)
+            best_color = unique_colors[sorted_indices[0]]  # Default to most frequent
             
-            for color, count in zip(unique_colors, counts):
-                contrast = np.linalg.norm(color - bg_color)
-                if contrast > max_contrast and count > len(pixels) * 0.05:
-                    max_contrast = contrast
-                    text_color = tuple(map(int, color))
+            for idx in sorted_indices[:5]:  # Check top 5 colors
+                color = unique_colors[idx]
+                count = counts[idx]
+                percentage = (count / len(pixels)) * 100
+                
+                if percentage > 5.0:  # Only consider colors with significant presence
+                    contrast = np.linalg.norm(color - bg_color)
+                    print(f"  DEBUG: Color RGB{tuple(color)} contrast: {contrast:.2f}")
+                    
+                    if contrast > max_contrast:
+                        max_contrast = contrast
+                        best_color = color
             
-            return text_color
-        except:
+            # SMART FALLBACK: If best contrasting color is still very similar to background, force white
+            if max_contrast < 20:  # Very low contrast means we're mostly getting background
+                avg_detected_brightness = np.mean([np.mean(unique_colors[idx]) for idx in sorted_indices[:3]])
+                print(f"  DEBUG: Very low contrast detected ({max_contrast:.2f}), avg brightness: {avg_detected_brightness:.1f}")
+                
+                if avg_detected_brightness < 120 and bg_brightness < 120:  # Both dark
+                    print(f"  DEBUG: FORCING WHITE COLOR due to dark background and low contrast")
+                    final_color = (255, 255, 255)
+                    print(f"  DEBUG: FINAL COLOR (FORCED): RGB{final_color}")
+                    return final_color
+            
+            print(f"  DEBUG: Best contrasting color: RGB{tuple(best_color)} (contrast: {max_contrast:.2f})")
+            final_color = tuple(map(int, best_color))
+            print(f"  DEBUG: FINAL COLOR: RGB{final_color}")
+            return final_color
+            
+        except Exception as e:
+            print(f"  DEBUG: Error in advanced color extraction: {e}")
             return (255, 255, 255)
     
-    def _extract_background_color(self, img_array, x, y, w, h) -> tuple:
-        """Extract background color around region"""
+    def _extract_background_color_advanced(self, img_array: np.ndarray, x: int, y: int, w: int, h: int) -> tuple:
+        """Enhanced background color extraction"""
         try:
             samples = []
-            offset = 15
+            offset = max(5, min(w, h) // 4)
             
-            # Sample around the region
-            for dy in [-offset, offset]:
-                for dx in range(-offset, w + offset, 5):
-                    sample_x, sample_y = x + dx, y + dy
-                    if 0 <= sample_x < img_array.shape[1] and 0 <= sample_y < img_array.shape[0]:
-                        samples.append(img_array[sample_y, sample_x])
+            # Sample multiple regions around the text
+            sample_regions = [
+                # Above text
+                (x, y - offset, w, offset//2),
+                # Below text  
+                (x, y + h, w, offset//2),
+                # Left of text
+                (x - offset, y, offset//2, h),
+                # Right of text
+                (x + w, y, offset//2, h),
+                # Corners
+                (x - offset//2, y - offset//2, offset//2, offset//2),
+                (x + w, y - offset//2, offset//2, offset//2),
+                (x - offset//2, y + h, offset//2, offset//2),
+                (x + w, y + h, offset//2, offset//2)
+            ]
+            
+            for sx, sy, sw, sh in sample_regions:
+                # Ensure coordinates are within image bounds
+                sx = max(0, min(sx, img_array.shape[1] - 1))
+                sy = max(0, min(sy, img_array.shape[0] - 1))
+                ex = max(sx + 1, min(sx + sw, img_array.shape[1]))
+                ey = max(sy + 1, min(sy + sh, img_array.shape[0]))
+                
+                if ex > sx and ey > sy:
+                    region_samples = img_array[sy:ey, sx:ex].reshape(-1, 3)
+                    if len(region_samples) > 0:
+                        samples.extend(region_samples)
             
             if samples:
-                return tuple(map(int, np.median(samples, axis=0)))
-            return (41, 128, 185)
-        except:
+                samples = np.array(samples)
+                # Use median for robust estimation
+                bg_color = np.median(samples, axis=0)
+                return tuple(map(int, bg_color))
+            
+            return (41, 128, 185)  # Default blue background
+            
+        except Exception as e:
+            print(f"Error extracting background color: {e}")
             return (41, 128, 185)
     
-    def _appears_bold(self, region) -> bool:
-        """Detect if text appears bold"""
+    def _calculate_contrast_ratio(self, text_color: tuple, bg_color: tuple) -> float:
+        """Calculate contrast ratio between text and background"""
         try:
-            gray = np.mean(region, axis=2)
-            bg_threshold = np.mean(gray)
-            text_pixels = np.sum(gray < bg_threshold * 0.8)
-            total_pixels = region.shape[0] * region.shape[1]
-            return (text_pixels / total_pixels) > 0.25
-        except:
-            return False
+            def luminance(color):
+                """Calculate relative luminance"""
+                rgb = [c / 255.0 for c in color]
+                rgb = [c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4 for c in rgb]
+                return 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]
+            
+            l1 = luminance(text_color)
+            l2 = luminance(bg_color)
+            
+            lighter = max(l1, l2)
+            darker = min(l1, l2)
+            
+            contrast_ratio = (lighter + 0.05) / (darker + 0.05)
+            return contrast_ratio
+            
+        except Exception as e:
+            return 4.5  # Default reasonable contrast
+    
+    def _calculate_text_density(self, text_region: np.ndarray) -> float:
+        """Calculate text density in the region"""
+        try:
+            if text_region.size == 0:
+                return 0.3
+            
+            gray = cv2.cvtColor(text_region, cv2.COLOR_RGB2GRAY)
+            _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            
+            # Calculate ratio of text pixels to total pixels
+            text_pixels = np.sum(binary < 128)  # Dark pixels are text
+            total_pixels = binary.size
+            
+            density = text_pixels / total_pixels
+            return float(density)
+            
+        except Exception as e:
+            return 0.3
+    
+    def calculate_optimal_font_size_for_translation(self, original_text: str, translated_text: str, 
+                                                   original_bbox: Dict, language: str, base_size: Optional[int] = None) -> int:
+        """Simplified translation-aware font size calculation"""
+        try:
+            original_width = original_bbox['width']
+            original_height = original_bbox['height']
+            
+            # Use provided base size or calculate from height
+            if base_size is None:
+                base_size = max(8, int(original_height * 0.75))
+            
+            # Only adjust if there's a significant difference in text length
+            length_ratio = 1.0  # Default value in case the condition is not met
+            orig_len = len(original_text.strip())
+            trans_len = len(translated_text.strip())
+            
+            if orig_len > 0 and trans_len > 0:
+                length_ratio = trans_len / orig_len
+                
+                # Only adjust for significant differences (>30% change)
+                if length_ratio > 1.3:  # Text got much longer
+                    adjustment = min(0.9, 1.0 / (length_ratio ** 0.3))  # Gentle reduction
+                    adjusted_size = int(base_size * adjustment)
+                elif length_ratio < 0.7:  # Text got much shorter
+                    adjustment = min(1.2, length_ratio ** 0.3 + 0.8)  # Gentle increase
+                    adjusted_size = int(base_size * adjustment)
+                else:
+                    adjusted_size = base_size  # No significant change
+            else:
+                adjusted_size = base_size
+            
+            # Ensure reasonable bounds
+            final_size = max(8, min(48, adjusted_size))
+            
+            if final_size != base_size:
+                print(f"Translation size adjustment: {base_size} → {final_size} (ratio: {length_ratio:.2f})")
+            
+            return final_size
+            
+        except Exception as e:
+            print(f"Error calculating translation size: {e}")
+            return base_size or max(12, int(original_bbox['height'] * 0.75))
+    
+    def _extract_text_color(self, region) -> tuple:
+        """Extract text color from region (kept for compatibility)"""
+        return self._extract_text_color_advanced(region, region)
+    
+    def _extract_background_color(self, img_array, x, y, w, h) -> tuple:
+        """Extract background color around region (kept for compatibility)"""
+        return self._extract_background_color_advanced(img_array, x, y, w, h)
+    
+    def _appears_bold(self, region) -> bool:
+        """Detect if text appears bold (kept for compatibility)"""
+        weight = self._detect_font_weight_advanced(region, 16)  # Assume 16px for compatibility
+        return weight == 'bold'

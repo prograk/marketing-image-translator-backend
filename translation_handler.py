@@ -1,13 +1,9 @@
-
-import requests
-import json
-from typing import List, Dict, Optional
+from typing import List, Dict
 import asyncio
 import aiohttp
-from concurrent.futures import ThreadPoolExecutor
 
 class TranslationHandler:
-    def __init__(self, api_key: str = None):
+    def __init__(self, api_key: str = ""):
         """
         Initialize Translation Handler with OpenRouter API
         
@@ -303,7 +299,7 @@ class MockTranslationHandler:
             }
         }
     
-    def translate_sync(self, text: str, target_language: str, model: str = None) -> Dict:
+    def translate_sync(self, text: str, target_language: str, model: str = "") -> Dict:
         """
         Mock translation for testing
         
@@ -338,11 +334,11 @@ class MockTranslationHandler:
                 'model': 'mock'
             }
     
-    async def translate_single(self, text: str, target_language: str, model: str = None, context: str = "") -> Dict:
+    async def translate_single(self, text: str, target_language: str, model: str = "", context: str = "") -> Dict:
         """Async wrapper for mock translation"""
         return self.translate_sync(text, target_language, model)
-    
-    async def translate_batch(self, texts: List[Dict], target_language: str, model: str = None) -> List[Dict]:
+
+    async def translate_batch(self, texts: List[Dict], target_language: str, model: str = "") -> List[Dict]:
         """Mock batch translation"""
         results = []
         for text_item in texts:
